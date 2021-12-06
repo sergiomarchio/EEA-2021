@@ -13,4 +13,4 @@ En este repositorio están los archivos del Trabajo Final: notebooks, bibliograf
 * [1_introduccion.pdf](1_introduccion.pdf): Material utilizado para el video 1.
 * [2_datos_simulados](2_datos_simulados): Material utilizado para el video 2. 
 * [3_datos_reales](3_datos_reales): Material utilizado para los videos 3. 
-* [4_Regresion_Bayesiana.pdf](4_Regresion_Bayesiana.pdf): Material utilizado para el viceo 4. 
+* [4_Regresion_Bayesiana.pdf](4_Regresion_Bayesiana.pdf): Material utilizado para el video 4. 
