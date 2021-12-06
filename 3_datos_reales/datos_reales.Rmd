@@ -1,0 +1,432 @@
+---
+title: "TP Final - EEA 2021: Modelado Bayesiano en datasets pequeños"
+author: "Santiago Amena, Sergio Marchio"
+output:
+  html_document:
+    df_print: paged
+    toc: yes
+  html_notebook:
+    toc: yes
+    toc_float: yes
+---
+
+# Setup
+
+```{r}
+library(glue)
+
+library(tidyverse)
+library(tidymodels)
+library(GGally)
+
+library(rstan)
+library(shinystan)
+library(rstanarm)
+```
+
+
+# Análisis exploratorio
+
+```{r}
+tinto <- read.csv("./datos/winequality-red.csv", sep = ";")
+```
+
+
+```{r}
+tinto
+```
+
+```{r}
+summary(tinto)
+```
+
+```{r}
+glimpse(tinto)
+```
+
+
+```{r, fig.width=12, fig.height=9, fig.align='center'}
+ggpairs(tinto, aes(alpha = 0.5)) + theme_bw()
+```
+
+La variable más correlacionada con *quality* es *alcohol*: corr = 0.476
+
+- *quality* es una medida arbitraria de la calidad del vino yendo de 0 (muy malo) a 10 (excelente).
+- *alcohol* es la graduación alcohólica medida en porcentaje volumen en volumen (% vol.).
+
+```{r}
+ggplot(tinto, aes(x = alcohol, y = quality)) +
+  geom_point(color = "darkorchid4", alpha = 0.5, shape = 16, size = 2) + 
+  ggtitle("Vino tinto") +
+  xlab("alcohol / % vol.") +
+  ylab("qaulity / u.a.")
+
+```
+
+
+Se explora el modelo
+
+$quality = \beta_0 + \beta_1 alcohol + \varepsilon$
+
+```{r}
+ajuste_exploratorio <- lm(quality ~ alcohol, tinto)
+
+summary(ajuste_exploratorio)
+```
+
+Se grafican los datos junto con el ajuste lineal correspondiente
+
+```{r}
+ggplot(tinto, aes(x = alcohol, y = quality)) + 
+  geom_point(color = "darkorchid4", alpha = 0.5, shape = 16, size = 2) + 
+  geom_abline(intercept = coef(ajuste_exploratorio)[1], 
+              slope = coef(ajuste_exploratorio)[2],
+              color = "firebrick3") +
+  ggtitle("Vino tinto - Ajuste exploratorio") +
+  xlab("alcohol / % vol.") +
+  ylab("qaulity / u.a.")
+```
+
+Se seleccionan las variables a utilizar
+
+```{r}
+datos <- tinto %>% 
+    select(alcohol, quality)
+
+datos
+```
+
+# Diseño experimental
+
+Hay 1599 observaciones.
+
+Se realizan 5 experimentos, donde en cada experimento se toma un tamaño de muestra distinto.
+
+En cada experimento se toman 39 observaciones al azar, sobre las cuales se aplica un modelo linal frecuentista cuyos parámetros son utlizados en las prior del modelo bayesiano optimo, haciendo las veces de "informacion conocida de antes/estudios previos"
+
+Con las restantes 1560 observaciones se hace un cross validation invertido para evaluar la performance de cada metodología
+
+* frecuentista
+* bayesiano prior no informativa
+* bayesiano prior "optima"
+
+de la siguiente manera:
+
+![Esquema de partición de los datos para los experimentos.](./imagenes/particion_datos.png)
+
+Se estuidan tamaños de muestra de 6, 12, 24, 40 y 120 observaciones:
+
+- ***experimento 1:*** 1560/6 = 260 grupos de 6 observaciones
+- ***experimento 2:*** 1560/12 = 130 grupos de 12 observaciones
+- ***experimento 3:*** 1560/24 = 65 grupos de 24 observaciones
+- ***experimento 4:*** 1560/40 = 39 grupos de 40 observaciones
+- ***experimento 5:*** 1560/120 = 13 grupos de 120 observaciones
+
+Lo llamamos *cross validation invertido* ya que el modelo se entrena con un solo *fold* y se evalúa en todos los demás, a diferencia del *cross validation* tradicional, donde se entrena el modelo en $k-1$ *folds* y se evalúa en el restante.
+
+Como medidas de performance se tomarán el $R^2$, $RMSE$ y $MAE$.
+
+```{r}
+
+# Conjutos de etiquetas para cada set de experimentos.
+# la etiqueta '0' corresponde a los datos usados para obtener la prior "optima"
+# las etiquetas 1, ..., k corresponden a los subconjuntos para la cross validation
+
+# Numero de observaciones para crear la prior optima
+nobs_base <- 39
+# Numero de grupos para cada experimento
+n_grupos <- c(260, 130, 65, 39, 13)
+# Numero total de observaciones
+n <- nrow(datos)
+
+grupos <- lapply(n_grupos, FUN = function(x){ 
+    # numero de observaciones por grupo para cada experimento
+    nobs <- (n - nobs_base)/x
+    
+    # Fija semilla para mantener reproducibilidad
+    set.seed(n*x)
+    
+    # Devuelve para cada experimento una lista con las etiquetas de grupo ordenadas al azar
+    sample(c(rep(0, nobs_base), rep(1:x, nobs)))
+})
+
+# Para cada experimento nombra la columna de las etiquetas de grupo como "ex",
+# donde x es el numero de experimento
+exp <- lapply(1:length(n_grupos), FUN = function(x) paste0("e", x)) %>% unlist()
+
+# se agregan al dataframe las columnas con las etiquetas de grupo para cada experimento
+datos[exp] <- grupos
+
+datos
+```
+
+
+```{r}
+# Funcion para obtener las metricas de una estimacion: R2 adj, rmse, mae
+get_metricas <- function(truth, estimate, p = 1){
+    r2 <- rsq_vec(truth = truth, estimate = estimate)
+    n <- length(truth)
+    r2adj <- 1 - (1 - r2)*(n - 1)/(n - p)
+    
+    rmse <- rmse_vec(truth = truth, estimate = estimate)
+    mae <- mae_vec(truth = truth, estimate = estimate)
+    
+    data.frame(rsq_adj = r2adj, rmse = rmse, mae = mae)
+}
+```
+
+
+Para cada experimento:
+* Se calcula la prior optima con un modelo lineal sobre el grupo "0".
+* Se entrena en un grupo todos los modelos y se valida en los demás grupos.
+* Se repite el paso anterior en cada grupo.
+
+```{r}
+# Funcion auxiliar para generar el contenido del archivo .stan dinamicamente
+# predefinido para 3 parametros: beta0 ~ normal, beta1 ~ normal, sigma ~ exponential
+# los argumentos de la funcion son las prior para el modelo stan.
+# sigma_lambda es el parametro de la exponencial: lambda = 1/media
+get_stan_code <- function(b0_mu, b0_sigma, b1_mu, b1_sigma, sigma_lambda){
+    glue(
+    "
+    data {
+      int<lower=0> N;
+      vector[N] x;
+      vector[N] y;
+      
+      int<lower=0> N_val;
+      vector[N_val] x_val;
+    }
+    parameters {
+      real beta0;
+      real beta1;
+      real<lower=0> sigma;
+    }
+    model {
+      beta0 ~ normal({{b0_mu}}, {{b0_sigma}});
+      beta1 ~ normal({{b1_mu}}, {{b1_sigma}});
+      sigma ~ exponential({{sigma_lambda}});
+      //y ~ normal(beta0 + beta1 * x, sigma);
+      y ~ student_t(2, beta0 + beta1 * x, sigma);
+    }
+    generated quantities {
+      //real y_hat [N_val] = normal_rng(beta0 + beta1 * x_val, sigma);
+      real y_hat [N_val] = student_t_rng(2, beta0 + beta1 * x_val, sigma);
+    }
+    
+    ", .open = "{{", .close = "}}"
+    )
+}
+```
+
+
+## Ejecución
+
+```{r}
+
+# Archivo para guardar los resultados
+archivo_resultados <- "resultados.rds"
+if(!file.exists(archivo_resultados)){
+    resultados <- data.frame()
+} else {
+    resultados <- readRDS(archivo_resultados)
+}
+
+# Para guardar los tiempos de ejecucion, solamente para tener una noción de lo que tarda el script
+archivo_time <- "time.csv"
+if(!file.exists(archivo_time)){
+    time <- data.frame()
+} else {
+    time <- read.csv(archivo_time)
+    time <- time[, !(names(time) %in% c("X", "d", "unit"))]
+    
+    # Corrige clase de la columna con la fecha hora del log
+    time$t <- as.POSIXct(time$t)
+}
+
+
+# Se crea el contenido del archivo .stan para el modelo con priors no informativas:
+prior_noinfo_stan <- get_stan_code(b0_mu = 0, b0_sigma = 1000, 
+                                   b1_mu = 0, b1_sigma = 1000, 
+                                   sigma_lambda = 1 / 100)
+
+
+# Se realizan todos los experimentos
+for (e in exp) {
+    time <- rbind(time,
+                  data.frame(e = e, grupo = NA, t = Sys.time()))
+    
+    # Priors optimas para modelo bayesiano
+    priors <- lm(quality ~ alcohol, datos[datos[e] == 0,]) %>% summary()
+    
+    # se extraen los estimadores de media y desvio para beta_0
+    b0_mu <- priors$coefficients["(Intercept)", "Estimate"]
+    b0_sigma <- priors$coefficients["(Intercept)", "Std. Error"]
+    
+    # se extraen los estimadores de media y desvio para beta_1
+    b1_mu <- priors$coefficients["alcohol", "Estimate"]
+    b1_sigma <- priors$coefficients["alcohol", "Std. Error"]
+    
+    # se extrae el estimador de la media para sigma
+    sigma_mean <- priors$sigma
+    
+    # Se crea el contenido del archivo .stan con las prior optimas
+    prior_optima_stan <- get_stan_code(b0_mu = b0_mu, b0_sigma = b0_sigma, 
+                                       b1_mu = b1_mu, b1_sigma = b1_sigma, 
+                                       sigma_lambda = 1 / sigma_mean)
+    
+    
+    # Se obtienen los grupos que todavia no se calcularon para este experimento
+    grupos_exp <- unique(datos[datos[e] != 0, e])
+    grupos_faltan <- setdiff(grupos_exp, resultados[resultados$exp == e, "grupo"])
+    
+    # Para cada grupo se entrenan los modelos en un grupo y se calculan las metricas con los grupos restantes
+    for (grupo in grupos_faltan){
+        time <- rbind(time,
+                      data.frame(e = e, grupo = grupo, t = Sys.time()))
+        
+        # Datos de entrenamiento
+        datos_grupo <- datos[datos[[e]] == grupo,]
+        # Datos de validación
+        datos_validacion <- datos[!(datos[[e]] %in% c(0, grupo)), ]
+        
+        # Se entrena modelo frecuentista
+        frec <- lm(quality ~ alcohol, datos_grupo)
+        # Se extraen obtienen los valores predichos
+        frec_estimate <- augment(frec, newdata = datos_validacion)$.fitted
+        
+        # Se crea data para stan
+        dat_stan <- list(N = nrow(datos_grupo),
+                         y = datos_grupo$quality,
+                         x = datos_grupo$alcohol,
+                         N_val = nrow(datos_validacion),
+                         x_val = datos_validacion$alcohol)
+        
+        # Se entrena modelo bayesiano, priors no informativas
+        bayes_noinfo <- stan(model_code = prior_noinfo_stan, data = dat_stan,
+                             chains = 3, iter = 1000, warmup = 300, thin = 1)
+        # Se extraen los valores predichos de la salida del modelo
+        b_noinfo_estimate <- summary(bayes_noinfo)$summary[, "mean"][grepl("^y_hat", names(bayes_noinfo))]
+        
+        #Se entrena modelo bayesiano, priors optimas
+        bayes_optima <- stan(model_code = prior_optima_stan, data = dat_stan,
+                             chains = 3, iter = 1000, warmup = 300, thin = 1)
+        # Se extraen los valores predichos de la salida del modelo
+        b_optima_estimate <- summary(bayes_optima)$summary[, "mean"][grepl("^y_hat", names(bayes_optima))]
+        
+        resultados <- rbind(resultados,
+                            cbind(
+                                data.frame(exp = e, grupo = grupo, modelo = "frec"),
+                                get_metricas(truth = datos_validacion$quality, estimate = frec_estimate)),
+                            cbind(
+                                data.frame(exp = e, grupo = grupo, modelo = "bayes_noinfo"),
+                                get_metricas(truth = datos_validacion$quality, estimate = b_noinfo_estimate)),
+                            cbind(
+                                data.frame(exp = e, grupo = grupo, modelo = "bayes_optima"),
+                                get_metricas(truth = datos_validacion$quality, estimate = b_optima_estimate))
+        )
+        
+        # Se guarda el avance del experimento
+        saveRDS(resultados, file = archivo_resultados)
+        
+        write.csv(time %>% mutate(d = t - lag(t),
+                                  unit = units.difftime(d)), archivo_time)
+    }
+    
+}
+
+```
+
+# Resultados
+
+```{r}
+resultados
+```
+
+
+Se crea columna con el tamaño de muestra para mayor claridad en los gráficos
+
+```{r}
+# Se relacionan los nombres de los experimentos con el tamaño de la muestra
+niveles_muestra <- c("6" = "e1", "12" = "e2", "24" = "e3", "40" = "e4", "120" = "e5")
+
+# Se crea la nueva variable
+resultados <- resultados %>% 
+    mutate(tam = fct_recode(exp, !!!niveles_muestra))
+
+resultados
+```
+
+
+```{r}
+# función para graficar boxplot por grupos
+boxplot_facet <- function(datos, x, y, grupo, titulo = "", xlab = "", ylab = ""){
+    # Se asigna la etiqueta al nombre de la variable si no fue configurada
+    if(xlab == "") xlab = as.name(x)
+    if(ylab == "") ylab = as.name(y)
+    
+    ggplot(datos, aes(x = !!as.name(x), y = !!as.name(y))) +
+        geom_boxplot() +
+        facet_wrap(grupo) +
+        ggtitle(titulo) +
+        xlab(xlab) +
+        ylab(ylab) +
+        theme(strip.background = element_rect(fill = "rosybrown2"))
+}
+```
+
+
+Variación de las métricas con el tamaño de muestra para cada modelo:
+
+```{r}
+boxplot_facet(resultados, x = "tam", y = "rsq_adj", grupo = "modelo", 
+              titulo = bquote(R^2), xlab = "Tamaño de muestra")
+
+boxplot_facet(resultados, x = "tam", y = "rmse", grupo = "modelo", 
+              titulo = "RMSE", xlab = "Tamaño de muestra")
+
+boxplot_facet(resultados, x = "tam", y = "mae", grupo = "modelo", 
+              titulo = "MAE", xlab = "Tamaño de muestra")
+```
+
+
+
+Variación de las métricas con el modelo para cada tamaño de muestra:
+
+```{r}
+for(t in unique(resultados$tam)){
+    plot <- resultados %>% 
+        filter(tam == t) %>% 
+        boxplot_facet(x = "modelo", y = "rsq_adj", grupo = "tam",
+                      titulo = bquote(R^2))
+    
+    print(plot)
+}
+```
+
+```{r}
+for(t in unique(resultados$tam)){
+    plot <- resultados %>% 
+        filter(tam == t) %>% 
+        boxplot_facet(x = "modelo", y = "rmse", grupo = "tam",
+                      titulo = "RMSE")
+    
+    print(plot)
+}
+```
+
+```{r}
+for(t in unique(resultados$tam)){
+    plot <- resultados %>% 
+        filter(tam == t) %>% 
+        boxplot_facet(x = "modelo", y = "mae", grupo = "tam",
+                      titulo = "MAE")
+    
+    print(plot)
+}
+```
+
+
+
+
+

@@ -1,0 +1,312 @@
+---
+title: "TP2 - Datos simulados"
+author: "Santiago Amena - Sergio Marchio"
+output: html_notebook
+---
+
+
+```{r}
+rm( list=ls() ) # limpiamos la memoria
+gc()  # garbage collection
+```
+
+```{r}
+library(simglm)
+library(tidyverse)
+library(rstan)
+```
+
+```{r}
+set.seed(321) # fijamos la semilla para que todos los datos simulados sean iguales
+setwd("C:/Users/santi/projects/maestria/eea/") # Cambiar el directorio
+```
+
+A continuación leemos los archivos .stan para la generación de modelos bayesianos
+```{r}
+archivo_stan = "./modelo_bayesiano.stan"
+stan_code = readChar(archivo_stan, file.info(archivo_stan)$size)
+archivo_stan_prior_mala = "./modelo_bayesiano_prior_mala.stan"
+stan_code_prior_mala = readChar(archivo_stan_prior_mala, file.info(archivo_stan_prior_mala)$size)
+
+```
+
+Generaremos 500 datasets simulados con tamaños de muestra 10, 20, 30, 40 y 50. Es decir, en total tendremos 2500 datasets. El modelo del que provendrán los datos es y ~ 2 + 0.3 * x1 + error, donde el error se distribuye como una normal(0, 5). Primero seteamos los valores verdaderos de los parámetros:
+```{r}
+alpha_true = 2
+beta_true = 0.3
+sample_size = c(10,20,30,40,50)
+```
+
+Generamos los datasets y estimamos un modelo frecuentista para cada uno de ellos.
+```{r}
+
+for (j in 1:5) {
+  
+  alphas_freq = c() # Acá guardaremos los alphas estimados en cada iteración
+  betas_freq = c() # Acá los betas estimados
+  
+  for (i in 1:500) {
+    
+    print(paste0("Tamaño de muestra: ", sample_size[j], ". Muestra número ", i))
+    # simulamos el dataset:
+    sim_arguments <- list(
+      formula = y ~ 1 + x1,
+      fixed = list(x1 = list(var_type = 'continuous', mean = 180, sd = 30)),
+      error = list(variance = 25),
+      sample_size = sample_size[j],
+      reg_weights = c(alpha_true, beta_true)
+    )
+    datos = simulate_fixed(data = NULL, sim_arguments) %>%
+      simulate_error(sim_arguments) %>%
+      generate_response(sim_arguments)
+    
+    # estimamos el modelo:
+    reg_lineal = lm(formula=y ~ x1, data=datos)
+    
+    # guardamos las estimaciones
+    alphas_freq[i] = coef(reg_lineal)[1]
+    betas_freq[i] = coef(reg_lineal)[2]
+    
+  }
+  
+  # Armamos un csv con las estimaciones
+  estimaciones_df_freq = data.frame(
+    alphas_freq,
+    betas_freq
+  )
+  # Lo exportamos en un csv
+  nombre_archivo = paste0("./sample_size_", sample_size[j], "_estimaciones_df_freq.csv")
+  write.csv(estimaciones_df_freq, nombre_archivo)
+
+}
+
+```
+
+Luego estimamos un modelo bayesiano con prior óptima
+```{r}
+
+for (j in 1:5) {
+  
+  alphas_bayes_bueno = c() # Acá guardaremos los alphas estimados en cada iteración
+  betas_bayes_bueno = c() # Acá los betas estimados
+  
+  for (i in 1:500) {
+    
+    print(paste0("Tamaño de muestra: ", sample_size[j], ". Muestra número ", i))
+    # simulamos el dataset:
+    sim_arguments <- list(
+      formula = y ~ 1 + x1,
+      fixed = list(x1 = list(var_type = 'continuous', mean = 180, sd = 30)),
+      error = list(variance = 25),
+      sample_size = sample_size[j],
+      reg_weights = c(alpha_true, beta_true)
+    )
+    datos = simulate_fixed(data = NULL, sim_arguments) %>%
+      simulate_error(sim_arguments) %>%
+      generate_response(sim_arguments)
+    
+    # estimamos el modelo: haremos 1000 iteraciones
+    y = datos$y
+    x1 = datos$x1
+    dat = list(
+      N = nrow(datos),
+      p = 2,
+      y = y,
+      x = x1
+    )
+    options(nC.cores=4)
+    
+    ajuste = stan(
+      model_code=stan_code,
+      data=dat,
+      chains=3,
+      iter=1000,
+      warmup=200,
+      thin=1
+    )
+    
+    # guardamos las estimaciones
+    alphas_bayes_bueno[i] = get_posterior_mean(ajuste, par="alpha")[4]
+    betas_bayes_bueno[i] = get_posterior_mean(ajuste, par="beta")[4]
+    
+  }
+  
+  # Generamos un dataset con las estimaciones
+  estimaciones_df_bayes_bueno = data.frame(
+    alphas_bayes_bueno,
+    betas_bayes_bueno
+  )
+  
+  # Lo exportamos
+  nombre_archivo = paste0("./sample_size_", sample_size[j], "_estimaciones_df_bayes_bueno.csv")
+  write.csv(estimaciones_df_bayes_bueno, nombre_archivo)
+  
+}
+
+```
+
+Por último, estimamos una regresión bayesiana con prior no informativa.
+```{r}
+
+for (j in 1:5) {
+  
+  alphas_bayes_malo = c() # Acá guardaremos los alphas estimados en cada iteración
+  betas_bayes_malo = c() # Acá los betas estimados
+  
+  for (i in 1:500) {
+    
+    print(paste0("Tamaño de muestra: ", sample_size[j], ". Muestra número ", i))
+    
+    # simulamos el dataset:
+    sim_arguments <- list(
+      formula = y ~ 1 + x1,
+      fixed = list(x1 = list(var_type = 'continuous', mean = 180, sd = 30)),
+      error = list(variance = 25),
+      sample_size = sample_size[j],
+      reg_weights = c(alpha_true, beta_true)
+    )
+    datos = simulate_fixed(data = NULL, sim_arguments) %>%
+      simulate_error(sim_arguments) %>%
+      generate_response(sim_arguments)
+    
+    # estimamos el modelo: haremos 1000 iteraciones
+    y = datos$y
+    x1 = datos$x1
+    dat = list(
+      N = nrow(datos),
+      p = 2,
+      y = y,
+      x = x1
+    )
+    options(nC.cores=4)
+    
+    ajuste = stan(
+      model_code=stan_code_prior_mala,
+      data=dat,
+      chains=3,
+      iter=1000,
+      warmup=200,
+      thin=1
+    )
+    
+    # guardamos las estimaciones
+    alphas_bayes_malo[i] = get_posterior_mean(ajuste, par="alpha")[4]
+    betas_bayes_malo[i] = get_posterior_mean(ajuste, par="beta")[4]
+    
+  }
+  
+  # Generamos un dataset con las estimaciones
+  estimaciones_df_bayes_malo = data.frame(
+    alphas_bayes_malo,
+    betas_bayes_malo
+  )
+  # lo exportamos
+  nombre_archivo = paste0("./sample_size_", sample_size[j], "_estimaciones_df_bayes_malo.csv")
+  write.csv(estimaciones_df_bayes_malo, nombre_archivo)
+  
+}
+```
+
+Luego de esto calculamos los sesgos de cada estimación y generamos un dataset con los mismos. A su vez, graficamos un boxplot de las estimaciones para cada modelo.
+```{r}
+sesgos_alpha_freq = c()
+sesgos_alpha_bayes_bueno = c()
+sesgos_alpha_bayes_malo = c()
+sesgos_beta_freq = c()
+sesgos_beta_bayes_bueno = c()
+sesgos_beta_bayes_malo = c()
+
+for (j in 1:5) {
+  
+  bayes_bueno = read.csv(paste0("./sample_size_",sample_size[j],"_estimaciones_df_bayes_bueno.csv")) # Leemos el dataset de estimaciones
+  bayes_bueno$X = "Bayes óptimo"
+  colnames(bayes_bueno) = c("modelo","est_alpha","est_beta")
+  sesgos_alpha_bayes_bueno[j] = alpha_true - mean(bayes_bueno$est_alpha) # calculamos sesgo en alpha
+  sesgos_beta_bayes_bueno[j] = beta_true - mean(bayes_bueno$est_beta) # calculamos sesgo en beta
+  
+  bayes_malo = read.csv(paste0("./sample_size_",sample_size[j],"_estimaciones_df_bayes_malo.csv"))
+  bayes_malo$X = "Bayes no informativo"
+  colnames(bayes_malo) = c("modelo","est_alpha","est_beta")
+  sesgos_alpha_bayes_malo[j] = alpha_true - mean(bayes_malo$est_alpha)
+  sesgos_beta_bayes_malo[j] = beta_true - mean(bayes_malo$est_beta)
+  
+  freq = read.csv(paste0("./sample_size_",sample_size[j],"_estimaciones_df_freq.csv"))
+  freq$X = "Frecuentista"
+  colnames(freq) = c("modelo","est_alpha","est_beta")
+  sesgos_alpha_freq[j] = alpha_true - mean(freq$est_alpha)
+  sesgos_beta_freq[j] = beta_true - mean(freq$est_beta)
+  
+  # concatenamos
+  data = rbind(
+    freq,
+    bayes_bueno,
+    bayes_malo
+  )
+  
+  # Imprimimos boxplots
+  plot1 = ggplot(data, aes(x=modelo, y=est_alpha)) + 
+    geom_boxplot(fill="slateblue", alpha=0.2)
+  
+  plot2 = ggplot(data, aes(x=modelo, y=est_beta)) + 
+    geom_boxplot(fill="slateblue", alpha=0.2)
+  
+  print(plot1)
+  print(plot2)
+}
+
+```
+
+Guardamos el dataset de sesgos en csv
+```{r}
+sesgos_df = data.frame(
+  sample_size,
+  sesgos_alpha_freq,
+  sesgos_alpha_bayes_bueno,
+  sesgos_alpha_bayes_malo,
+  sesgos_beta_freq,
+  sesgos_beta_bayes_bueno,
+  sesgos_beta_bayes_malo
+)
+write.csv(sesgos_df, "./sesgos_df_raw.csv")
+```
+
+Generamos el dataset de sesgos relativos
+```{r}
+
+sesgos_relativos = abs(sesgos_df) # primero los pasamos a valor absoluto
+colnames(sesgos_relativos)[1] = "sample_size"
+
+sesgos_freq = sesgos_relativos[,c("sample_size","sesgos_alpha_freq","sesgos_beta_freq")]
+colnames(sesgos_freq) = c("sample_size","sesgo_alpha","sesgo_beta")
+sesgos_freq$sesgo_alpha = sesgos_freq$sesgo_alpha / alpha_true # calculamos el sesgo relativo para alpha
+sesgos_freq$sesgo_beta = sesgos_freq$sesgo_beta / beta_true # calculamos el sesgo relativo para beta
+sesgos_freq$modelo = "Frecuentista"
+
+sesgos_bayes_bueno = sesgos_relativos[,c("sample_size","sesgos_alpha_bayes_bueno","sesgos_beta_bayes_bueno")]
+colnames(sesgos_bayes_bueno) = c("sample_size","sesgo_alpha","sesgo_beta")
+sesgos_bayes_bueno$sesgo_alpha = sesgos_bayes_bueno$sesgo_alpha / alpha_true
+sesgos_bayes_bueno$sesgo_beta = sesgos_bayes_bueno$sesgo_beta / beta_true
+sesgos_bayes_bueno$modelo = "Bayes óptimo"
+
+sesgos_bayes_malo = sesgos_relativos[,c("sample_size","sesgos_alpha_bayes_malo","sesgos_beta_bayes_malo")]
+colnames(sesgos_bayes_malo) = c("sample_size","sesgo_alpha","sesgo_beta")
+sesgos_bayes_malo$sesgo_alpha = sesgos_bayes_malo$sesgo_alpha / alpha_true
+sesgos_bayes_malo$sesgo_beta = sesgos_bayes_malo$sesgo_beta / beta_true
+sesgos_bayes_malo$modelo = "Bayes no informativo"
+
+# creamos dataset de sesgos relativos
+sesgos_relativos = rbind(
+  sesgos_freq,
+  sesgos_bayes_bueno,
+  sesgos_bayes_malo
+)
+```
+
+Graficamos los sesgos para cada tamaño muestral
+```{r}
+ggplot(sesgos_relativos, aes(x=sample_size, y=sesgo_alpha, group=modelo, color=modelo)) +
+  geom_line()
+
+ggplot(sesgos_relativos, aes(x=sample_size, y=sesgo_beta, group=modelo, color=modelo)) +
+  geom_line()
+```
